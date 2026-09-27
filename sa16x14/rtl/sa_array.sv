@@ -82,12 +82,69 @@
 // -----------------------------------------------------------------------------
 // What this module deliberately does not have
 // -----------------------------------------------------------------------------
-// No stagger network (day 8 -- act_in must arrive already skewed), no output
-// de-skew (day 9), no psum input or accumulate control (multi-tile K > ROWS is
-// day 18, on the extracted sums, never back through the packed domain), no
-// double buffering (day 6 -- there is one weight bank, so a load disturbs
-// results in flight and a tile change must be drained with zero activations),
-// and no valid signal (latency is a constant, flow control is days 11-13).
+// No stagger network (day 8 -- act_in and swap_in must arrive already skewed),
+// no output de-skew (day 9), no psum input or accumulate control (multi-tile
+// K > ROWS is day 18, on the extracted sums, never back through the packed
+// domain), and no valid signal (latency is a constant, flow control is days
+// 11-13).
+//
+// -----------------------------------------------------------------------------
+// Fact 3 — double-buffered weights, and what the host owes the array (day 6)
+// -----------------------------------------------------------------------------
+// Every cell holds a shadow bank (the shift chain) and an active bank (what the
+// multiplier reads); swap_in copies one to the other. Two consequences for the
+// host, and nothing else:
+//
+//   * wgt_shift_en may be held high *while activations are streaming*. The
+//     chain no longer touches anything in flight, so the drain across a tile
+//     change that days 2-5 required is gone. A 32-cycle load hides completely
+//     under a stream of 32 or more vectors.
+//
+//   * the shift chain must be IDLE for the whole swap window, and the window is
+//     ROWS + COL_PAIRS - 1 = 22 cycles, not ROWS. A swap reads the shadow bank
+//     as it stood before the edge, and a single shift displaces the entire
+//     2*ROWS-deep chain by one byte, so any cell that has not swapped yet then
+//     takes its weights from a neighbouring row's position. The swap reaches
+//     cell (i, p) at cycle v0-1+i+p -- skewed down the rows AND across the
+//     columns -- while wgt_shift_en is broadcast to all COL_PAIRS ports on the
+//     same cycle. The last cell to swap is therefore (ROWS-1, COL_PAIRS-1) at
+//     v0 + ROWS + COL_PAIRS - 3, so the next load may only start at
+//     v0 + ROWS + COL_PAIRS - 1 = v0 + 21.
+//
+//     This cost one debug cycle and it is worth stating plainly, because the
+//     obvious answer (ROWS, from the input stagger alone) is wrong and the
+//     symptom is confined to the far column-pairs: with the load started at
+//     v0 + ROWS, columns 0..3 are right and 4..13 are wrong, all in range.
+//
+//     Consequence: the load runs for 2*ROWS cycles from v0+ROWS+COL_PAIRS-1,
+//     so the next tile can begin at
+//
+//         v0 + 3*ROWS + COL_PAIRS = v0 + 55
+//
+//     at the earliest. The tile change costs zero idle activation cycles, but
+//     the tile *rate* is capped at one per 3*ROWS + COL_PAIRS vectors. That
+//     ceiling comes from sharing one shadow chain between the load and the
+//     swap. Two ways to lower it if a workload ever needs tiles that short:
+//     ping-pong the chain itself (a second 2-deep shift register per cell,
+//     +16 FFs/cell, floor 2*ROWS+1 = 33), or skew wgt_shift_en and the weight
+//     bus by one cycle per column-pair so the load tracks the swap (~170 FFs,
+//     floor 3*ROWS = 48). Neither is bought now: 55 vectors per tile is far
+//     below any real GEMM or conv tile. Under SA_ASSERT the window is policed
+//     at the bottom of this file; violating it is otherwise silent.
+//
+//   * the tile change costs zero cycles, but only if swap_in is presented with
+//     the same skew as act_in and one cycle ahead of it: to make vector v0 the
+//     first vector of the new tile, assert swap_in[i] in the cycle in which
+//     act_in[i] carries vector v0-1. The stagger network of day 8 gets this for
+//     free by carrying the swap bit as a 9th bit through each row's delay line.
+//     A flat swap is the failure mode to watch for: it is in range, and it
+//     corrupts exactly ROWS-1 vectors at each tile boundary.
+//
+// The array does not police the ordering between the last byte of a load and
+// the swap that publishes it -- that is the sequencer of day 13. What it does
+// police, under SA_ASSERT, is that the swap traverses the columns at exactly
+// the activation's rate (see the shadow chains at the bottom of this file) and,
+// in pe_pair, that a swap is not held over two shifting cycles.
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -115,6 +172,16 @@ module sa_array
   // ---- activations: one per row, already staggered (row i is i cycles late) -
   input  logic signed [NROWS-1:0][ACT_W-1:0]  act_in,
   output logic signed [NROWS-1:0][ACT_W-1:0]  act_out,
+
+  // ---- weight bank swap: one bit per row, staggered exactly like act_in -----
+  // swap_in[i] is a one-cycle pulse that must be presented one cycle before the
+  // first activation of the new tile appears on act_in[i]. It then rides
+  // rightwards through the array at one cycle per column-pair, in the same
+  // register stage as the activation, under the same enable. swap_out is the
+  // tail of that path: nothing consumes it, it exists so the depth is directly
+  // measurable (phase 5 of tb_wgt_dbuf) and so a second array could be chained.
+  input  logic        [NROWS-1:0]             swap_in,
+  output logic        [NROWS-1:0]             swap_out,
 
   // ---- column sums, still skewed by column-pair: LAT(j) = NROWS+2 + j/2 -----
   output logic signed [NCOLS-1:0][OUT_W-1:0]  col_sum
@@ -157,6 +224,7 @@ module sa_array
   // no sensitivity list at all under Icarus 12 (see column_pair.sv).
   // ---------------------------------------------------------------------------
   logic signed [NPAIRS:0][NROWS-1:0][ACT_W-1:0] ach;
+  logic        [NPAIRS:0][NROWS-1:0]            sch;   // the swap bus, alongside
   logic signed [NPAIRS-1:0][OUT_W-1:0]          se, so;
 
   genvar p, r;
@@ -164,15 +232,20 @@ module sa_array
     for (r = 0; r < NROWS; r++) begin : g_ain
       assign ach[0][r]     = act_in[r];
       assign act_out[r]    = ach[NPAIRS][r];
+      assign sch[0][r]     = swap_in[r];
+      assign swap_out[r]   = sch[NPAIRS][r];
     end
 
     for (p = 0; p < NPAIRS; p++) begin : g_pair
       // Per-instance buses, so every port connection is a whole variable.
       logic signed [NROWS-1:0][ACT_W-1:0] cp_ai, cp_ao;
+      logic        [NROWS-1:0]            cp_si, cp_so;
 
       for (r = 0; r < NROWS; r++) begin : g_row
         assign cp_ai[r]      = ach[p][r];
         assign ach[p+1][r]   = cp_ao[r];
+        assign cp_si[r]      = sch[p][r];
+        assign sch[p+1][r]   = cp_so[r];
       end
 
       column_pair #(
@@ -191,6 +264,8 @@ module sa_array
         .wgt_out      (wgt_out[p]),
         .act_in       (cp_ai),
         .act_out      (cp_ao),
+        .swap_in      (cp_si),
+        .swap_out     (cp_so),
         .sum_even     (se[p]),
         .sum_odd      (so[p])
       );
@@ -221,14 +296,19 @@ module sa_array
   // $error is not synthesisable.
   // ---------------------------------------------------------------------------
   logic signed [NPAIRS-1:0][NROWS-1:0][ACT_W-1:0] shadow;
+  logic        [NPAIRS-1:0][NROWS-1:0]            sshadow;
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      shadow <= '0;
+      shadow  <= '0;
+      sshadow <= '0;
     end else if (en) begin
-      shadow[0] <= act_in;
-      for (int q = 1; q < NPAIRS; q++)
-        shadow[q] <= shadow[q-1];
+      shadow[0]  <= act_in;
+      sshadow[0] <= swap_in;
+      for (int q = 1; q < NPAIRS; q++) begin
+        shadow[q]  <= shadow[q-1];
+        sshadow[q] <= sshadow[q-1];
+      end
     end
   end
 
@@ -238,7 +318,53 @@ module sa_array
         assert (act_out[i] === shadow[NPAIRS-1][i])
           else $error("sa_array: act_out[%0d]=%0d, want %0d -- horizontal delay is not a uniform %0d cycles",
                       i, act_out[i], shadow[NPAIRS-1][i], NPAIRS);
+
+      // The swap pulse must traverse at exactly the same rate as the activation
+      // it belongs to. Both are checked against a chain of the same depth, so a
+      // swap path that is one stage short or one stage long -- which would put
+      // some column-pair on the wrong tile for one vector, in range and wrong --
+      // fails here rather than in the arithmetic.
+      for (int i = 0; i < NROWS; i++)
+        assert (swap_out[i] === sshadow[NPAIRS-1][i])
+          else $error("sa_array: swap_out[%0d]=%0b, want %0b -- the swap pulse is not advancing at one cycle per column-pair like the activation",
+                      i, swap_out[i], sshadow[NPAIRS-1][i]);
     end
+  end
+
+  // ---------------------------------------------------------------------------
+  // The shift chain must be idle for the whole swap window.
+  //
+  // A swap copies the shadow bank as it stood *before* the edge, and one shift
+  // displaces the whole 2*NROWS-deep chain by one byte. The staggered swap takes
+  // NROWS enabled cycles to reach every row, so a shift anywhere inside that
+  // window hands some row a weight from a neighbouring row's position. Every
+  // value stays a legal INT8 and every column sum stays in range, so there is no
+  // other symptom.
+  //
+  // The window is SWAP_WIN = NROWS + NPAIRS - 1 cycles measured at this
+  // boundary: NROWS of input skew plus NPAIRS-1 of horizontal traverse, because
+  // the swap is skewed in both directions while wgt_shift_en is broadcast.
+  //
+  // swwin counts down from the FIRST pulse of a burst and must NOT be reloaded
+  // by the later pulses of the same burst, or a correct back-to-back schedule
+  // (next load starting at v0 + NROWS + NPAIRS - 1) would be flagged.
+  // ---------------------------------------------------------------------------
+  localparam int SWAP_WIN = NROWS + NPAIRS - 1;          // = 22
+
+  logic [$clog2(SWAP_WIN+1)-1:0] swwin;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)                        swwin <= '0;
+    else if (en) begin
+      if ((|swap_in) && swwin == '0)   swwin <= SWAP_WIN - 1;
+      else if (swwin != '0)            swwin <= swwin - 1'b1;
+    end
+  end
+
+  always @(posedge clk) begin
+    if (rst_n && en && wgt_shift_en && ((|swap_in) || swwin != '0))
+      $error("sa_array: wgt_shift_en asserted inside the %0d-cycle swap window; the chain has moved under a cell that has not swapped yet",
+             SWAP_WIN);
   end
 `endif
 
