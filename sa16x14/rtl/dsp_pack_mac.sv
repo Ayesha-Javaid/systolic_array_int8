@@ -1,26 +1,4 @@
-// -----------------------------------------------------------------------------
-// dsp_pack_mac.sv — two INT8 MACs in one DSP48E1
-//
-// Holds two stationary weights (w0, w1) and multiplies both by a single shared
-// activation in one DSP48E1, by packing the weights into separate bit-fields of
-// the 25-bit A port:
-//
-//     A = w1 * 2^K + w0      B = a
-//     P = A * B = (w1*a) * 2^K + (w0*a)
-//
-// The two products are then accumulated *in the packed domain* through the DSP
-// PCOUT->PCIN cascade, which is free, and only separated at the end of a
-// cascade group (see pack_extract.sv). CASCADE_DEPTH is bounded by the width of
-// the low field -- see docs/ARCHITECTURE.md §4.
-//
-// RTL style note: this is written as inferable arithmetic, not as an explicit
-// DSP48E1 primitive instantiation. Two reasons:
-//   1. It simulates in any open-source simulator, so CI is real.
-//   2. Vivado infers DSP48E1 from this shape reliably; the use_dsp attribute
-//      below makes that non-optional rather than a hope.
-// A primitive-instantiation variant lives behind `ifdef SA_USE_DSP_PRIMITIVE
-// for the cases where the inference does not give the pipeline you want.
-// -----------------------------------------------------------------------------
+
 `timescale 1ns / 1ps
 
 module dsp_pack_mac

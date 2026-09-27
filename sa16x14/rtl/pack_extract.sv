@@ -1,24 +1,3 @@
-// -----------------------------------------------------------------------------
-// pack_extract.sv — separate the two products out of a packed DSP result
-//
-// Given P = p1 * 2^K + p0, recover p0 and p1.
-//
-// This is NOT a plain bit-slice. A negative p0 is stored in two's complement in
-// the low field, which borrows from the field above it, so the naive slice
-// returns p1-1 whenever p0 < 0. The fix is to add the low field's sign bit back
-// into the high field:
-//
-//     p0 = signed(P[K-1:0])
-//     p1 = signed(P[47:K]) + P[K-1]
-//
-// Proof: signed(P[47:K]) = floor(P / 2^K) = floor(p1 + p0/2^K), which is p1 for
-// p0 >= 0 and p1-1 for p0 < 0. P[K-1] is exactly the sign of the low field. QED.
-//
-// Getting this wrong is the classic failure mode of INT8 DSP packing: it is
-// correct for ~half of all inputs, so it passes casual testing and then
-// produces subtly wrong inference results. tb_pack_extract.sv tests it
-// exhaustively for that reason.
-// -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
 module pack_extract
