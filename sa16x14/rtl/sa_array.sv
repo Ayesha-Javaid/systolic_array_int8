@@ -204,6 +204,42 @@ module sa_array
     end
   endgenerate
 
+`ifdef SA_ASSERT
+  // ---------------------------------------------------------------------------
+  // The uniform-horizontal-delay invariant, checked continuously.
+  //
+  // act_out[i] must be act_in[i] delayed by exactly NPAIRS enabled cycles, the
+  // same count for every row. If it is not, some column-pair is combining
+  // products from two different activation vectors and every column sum from
+  // that pair rightwards is wrong while staying entirely in range.
+  //
+  // The shadow chain resets to zero and advances only on en, exactly as the
+  // pe_pair activation registers do, so the two track from cycle zero and no
+  // warm-up window is needed.
+  //
+  // `always @(posedge clk)` rather than `always_ff`: simulation-only, and
+  // $error is not synthesisable.
+  // ---------------------------------------------------------------------------
+  logic signed [NPAIRS-1:0][NROWS-1:0][ACT_W-1:0] shadow;
 
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      shadow <= '0;
+    end else if (en) begin
+      shadow[0] <= act_in;
+      for (int q = 1; q < NPAIRS; q++)
+        shadow[q] <= shadow[q-1];
+    end
+  end
+
+  always @(posedge clk) begin
+    if (rst_n && en) begin
+      for (int i = 0; i < NROWS; i++)
+        assert (act_out[i] === shadow[NPAIRS-1][i])
+          else $error("sa_array: act_out[%0d]=%0d, want %0d -- horizontal delay is not a uniform %0d cycles",
+                      i, act_out[i], shadow[NPAIRS-1][i], NPAIRS);
+    end
+  end
+`endif
 
 endmodule
