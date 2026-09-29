@@ -14,9 +14,13 @@ module pe_pair
   input  logic                      en,            // datapath pipeline advance
 
   // ---- weight load chain (vertical) ----------------------------------------
-  input  logic                      wgt_shift_en,  // advance the weight chain
+  input  logic                      wgt_shift_en,  // advance the shadow chain
   input  logic signed [WGT_W-1:0]   wgt_in,
   output logic signed [WGT_W-1:0]   wgt_out,
+
+  // ---- weight bank swap (travels rightwards with the activation) ------------
+  input  logic                      swap_in,       // 1-cycle: active <= shadow
+  output logic                      swap_out,      // swap_in delayed one cycle
 
   // ---- activation (horizontal) ---------------------------------------------
   input  logic signed [ACT_W-1:0]   act_in,
@@ -34,29 +38,57 @@ module pe_pair
   localparam int LATENCY = 3;
 
   // ---------------------------------------------------------------------------
-  // Stationary weights: a 2-deep shift register that doubles as the weight
-  // storage. No separate load register -- the shift register IS the bank.
+  // Shadow bank: the 2-deep shift register. This is the load path and nothing
+  // else reads it except the swap below and the neighbour beneath.
   // ---------------------------------------------------------------------------
-  logic signed [WGT_W-1:0] w0_r, w1_r;
+  logic signed [WGT_W-1:0] w0_s, w1_s;
   logic signed [WGT_W-1:0] wgt_in_c;
 
-  // Clamp on the input stage only. w1_r is fed from w0_r and wgt_out from
-  // w1_r, both already clamped, so one comparator per cell is enough to make
+  // Clamp on the input stage only. w1_s is fed from w0_s and wgt_out from
+  // w1_s, both already clamped, so one comparator per cell is enough to make
   // every stored weight legal -- including weights that arrived through an
-  // upstream neighbour.
+  // upstream neighbour. The active bank is a copy of the shadow bank, so it
+  // inherits the clamp rather than needing its own.
   assign wgt_in_c = CLAMP_WGT ? sa_pkg::clamp_wgt(wgt_in) : wgt_in;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      w0_r <= '0;
-      w1_r <= '0;
+      w0_s <= '0;
+      w1_s <= '0;
     end else if (wgt_shift_en) begin
-      w0_r <= wgt_in_c;
-      w1_r <= w0_r;
+      w0_s <= wgt_in_c;
+      w1_s <= w0_s;
     end
   end
 
-  assign wgt_out = w1_r;
+  assign wgt_out = w1_s;
+
+  // ---------------------------------------------------------------------------
+  // Active bank: what the multiplier sees. Updated only by a swap, and only on
+  // an enabled edge -- the swap is part of the datapath timing, so it must
+  // freeze with the wavefront. A swap presented while en is low simply waits:
+  // en = 0 stretches the cycle in which the current activation is still being
+  // consumed, and a bank change inside that stretch would corrupt it.
+  //
+  // swap_out sits in the same register stage under the same enable, which is
+  // what keeps the swap pulse and the activation advancing at the same rate
+  // across the columns.
+  // ---------------------------------------------------------------------------
+  logic signed [WGT_W-1:0] w0_a, w1_a;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      w0_a     <= '0;
+      w1_a     <= '0;
+      swap_out <= 1'b0;
+    end else if (en) begin
+      swap_out <= swap_in;
+      if (swap_in) begin
+        w0_a <= w0_s;
+        w1_a <= w1_s;
+      end
+    end
+  end
 
   // ---------------------------------------------------------------------------
   // The MAC. act_in goes in unregistered; act_out comes back registered once
@@ -66,8 +98,8 @@ module pe_pair
     .clk       (clk),
     .rst_n     (rst_n),
     .en        (en),
-    .w0        (w0_r),
-    .w1        (w1_r),
+    .w0        (w0_a),
+    .w1        (w1_a),
     .act       (act_in),
     .acc_first (acc_first),
     .pcin      (pcin),
@@ -86,6 +118,28 @@ module pe_pair
         $warning("pe_pair: weight %0d clamped into [%0d,%0d]; host quantisation should be symmetric",
                  wgt_in, WGT_MIN, WGT_MAX);
     end
+  end
+
+  // A swap held high for a second consecutive cycle *while the shadow chain is
+  // shifting* copies a half-loaded tile into the active bank. One cycle
+  // overlapping the start of the next load is fine and is how back-to-back
+  // tiles work (see the header); two is not. This is silent otherwise: the
+  // active bank ends up holding a mixture of two tiles, entirely in range.
+  // Synchronous reset: sim-only state does not need an async one, and this keeps
+  // the number of async-reset usages in the file at one. (It does not silence
+  // the SYNCASYNCNET that `-Wall -DSA_ASSERT` reports on rst_n -- that comes
+  // from day 2's clamp-warning block reading rst_n synchronously while the
+  // weight shift register resets asynchronously, and it predates this file's
+  // double buffer. Lint is run without SA_ASSERT, as days 1-5 did.)
+  logic swap_q;
+  always @(posedge clk) begin
+    if (!rst_n)  swap_q <= 1'b0;
+    else if (en) swap_q <= swap_in;
+  end
+
+  always @(posedge clk) begin
+    if (rst_n && en && swap_in && swap_q && wgt_shift_en)
+      $error("pe_pair: swap_in held over two shifting cycles; the active bank is taking a partially loaded tile");
   end
 `endif
 
