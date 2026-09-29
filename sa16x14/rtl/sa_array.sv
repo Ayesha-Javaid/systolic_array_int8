@@ -1,4 +1,3 @@
-
 `timescale 1ns / 1ps
 
 module sa_array
@@ -134,7 +133,20 @@ module sa_array
 
 `ifdef SA_ASSERT
   // ---------------------------------------------------------------------------
-
+  // The uniform-horizontal-delay invariant, checked continuously.
+  //
+  // act_out[i] must be act_in[i] delayed by exactly NPAIRS enabled cycles, the
+  // same count for every row. If it is not, some column-pair is combining
+  // products from two different activation vectors and every column sum from
+  // that pair rightwards is wrong while staying entirely in range.
+  //
+  // The shadow chain resets to zero and advances only on en, exactly as the
+  // pe_pair activation registers do, so the two track from cycle zero and no
+  // warm-up window is needed.
+  //
+  // `always @(posedge clk)` rather than `always_ff`: simulation-only, and
+  // $error is not synthesisable.
+  // ---------------------------------------------------------------------------
   logic signed [NPAIRS-1:0][NROWS-1:0][ACT_W-1:0] shadow;
   logic        [NPAIRS-1:0][NROWS-1:0]            sshadow;
 
@@ -171,7 +183,24 @@ module sa_array
     end
   end
 
-
+  // ---------------------------------------------------------------------------
+  // The shift chain must be idle for the whole swap window.
+  //
+  // A swap copies the shadow bank as it stood *before* the edge, and one shift
+  // displaces the whole 2*NROWS-deep chain by one byte. The staggered swap takes
+  // NROWS enabled cycles to reach every row, so a shift anywhere inside that
+  // window hands some row a weight from a neighbouring row's position. Every
+  // value stays a legal INT8 and every column sum stays in range, so there is no
+  // other symptom.
+  //
+  // The window is SWAP_WIN = NROWS + NPAIRS - 1 cycles measured at this
+  // boundary: NROWS of input skew plus NPAIRS-1 of horizontal traverse, because
+  // the swap is skewed in both directions while wgt_shift_en is broadcast.
+  //
+  // swwin counts down from the FIRST pulse of a burst and must NOT be reloaded
+  // by the later pulses of the same burst, or a correct back-to-back schedule
+  // (next load starting at v0 + NROWS + NPAIRS - 1) would be flagged.
+  // ---------------------------------------------------------------------------
   localparam int SWAP_WIN = NROWS + NPAIRS - 1;          // = 22
 
   logic [$clog2(SWAP_WIN+1)-1:0] swwin;
