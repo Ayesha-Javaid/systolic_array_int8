@@ -17,13 +17,8 @@ module axis_act_slave
   input  logic                               s_axis_tlast,
   input  logic [USER_W-1:0]                  s_axis_tuser,
 
-  // ---- post-reset / mid-stream flush; day 13 schedules it -------------------
   input  logic                               flush,
 
-  // ---- the consumer's acceptance; day 12 drives it --------------------------
-  // High means "whatever leaves sa_datapath.sum_out this cycle will be taken".
-  // Because the datapath has no internal storage, this is also what permits an
-  // input vector to be admitted -- the two are one event.
   input  logic                               dn_ready,
 
   // ---- sa_datapath face ----------------------------------------------------
@@ -38,12 +33,7 @@ module axis_act_slave
   localparam int VEC_W = NROWS * ACT_W;              // 128
   localparam int PAY_W = TDATA_W + 1 + USER_W;       // 137 at the defaults
 
-  // ---------------------------------------------------------------------------
-  // Elaboration checks. The TDATA_W one is the load-bearing one and it is
-  // verified directly with a throwaway top rather than by a mutant, in the style
-  // of days 4, 7, 8 and 9: no legal instantiation can trip it, so no sweep can
-  // kill the guard itself.
-  // ---------------------------------------------------------------------------
+
   initial begin
     if (NROWS < 1)
       $fatal(1, "axis_act_slave: NROWS=%0d must be at least 1", NROWS);
@@ -55,3 +45,86 @@ module axis_act_slave
              TDATA_W, VEC_W);
   end
 
+
+  logic             up_v, up_r;
+  logic [PAY_W-1:0] up_pay;
+  logic             q_v, q_r;
+  logic [PAY_W-1:0] q_pay;
+
+  assign up_pay        = {s_axis_tuser, s_axis_tlast, s_axis_tdata};
+  assign up_v          = s_axis_tvalid & rst_n;
+  assign s_axis_tready = up_r & rst_n;
+
+  skid_buf #(
+    .W (PAY_W)
+  ) u_skid (
+    .clk      (clk),
+    .rst_n    (rst_n),
+    .up_valid (up_v),
+    .up_ready (up_r),
+    .up_data  (up_pay),
+    .dn_valid (q_v),
+    .dn_ready (q_r),
+    .dn_data  (q_pay)
+  );
+
+
+  assign act_en  = dn_ready & (flush | q_v);
+  assign act_vld = dn_ready & ~flush & q_v;
+  assign q_r     = act_vld;
+
+  // Row i comes from byte lane i of TDATA: the order a host memcpy of an int8
+  // K-vector produces, and the order the AXI byte lanes already imply. It is not
+  // a free choice -- the weights arrive by a separate port, so a reversed or
+  // rotated mapping pairs row i's activation with row NROWS-1-i's weights and
+  // every column sum comes out plausible and wrong. tb_axis_act_slave scores
+  // that against the golden model, and a one-hot lane phase names the offender.
+  //
+  // genvar continuous assigns, not a procedural element-wise write: day 4's
+  // combinational-array trap, and the propagation trap in NOTES-tooling.md.
+  genvar gi;
+  generate
+    for (gi = 0; gi < NROWS; gi = gi + 1) begin : g_lane
+      assign act_vec[gi] = flush ? '0
+                                 : $signed(q_pay[ACT_W*gi +: ACT_W]);
+    end
+  endgenerate
+
+  assign act_last = act_vld & q_pay[TDATA_W];
+  assign act_user = act_vld ? q_pay[TDATA_W+1 +: USER_W] : '0;
+
+`ifdef SA_ASSERT
+
+  logic             p_v, p_r;
+  logic [PAY_W-1:0] p_pay;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      p_v   <= 1'b0;
+      p_r   <= 1'b0;
+      p_pay <= '0;
+    end else begin
+      if (p_v && !p_r) begin
+        assert (s_axis_tvalid)
+          else $error("axis_act_slave: TVALID dropped before TREADY -- a beat was withdrawn, so an activation vector is silently missing");
+        assert ({s_axis_tuser, s_axis_tlast, s_axis_tdata} === p_pay)
+          else $error("axis_act_slave: TDATA/TLAST/TUSER changed while TVALID was held");
+      end
+      p_v   <= s_axis_tvalid;
+      p_r   <= s_axis_tready;
+      p_pay <= up_pay;
+    end
+  end
+
+  // act_vec must never carry a don't-care into the multipliers on an enabled
+  // cycle. This is the payoff of skid_buf resetting its data registers; it would
+  // fire if that reset were dropped.
+  always @(posedge clk) begin
+    if (rst_n && act_en) begin
+      assert (!$isunknown(act_vec))
+        else $error("axis_act_slave: act_vec has an x/z bit on an enabled cycle");
+    end
+  end
+`endif
+
+endmodule
